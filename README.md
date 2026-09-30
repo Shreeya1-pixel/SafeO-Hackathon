@@ -148,17 +148,53 @@ Many WAF products support **Arabic UI** or generic Arabic NLP. What rural UAE co
 
 **Honest positioning:** Arabic-language cybersecurity **products exist** (regional WAFs, enterprise suites). We are **not aware of a free, community-first platform** that combines **Arabic + Arabizi input protection, WhatsApp filtering, website risk passport, and school/SMB ERP hooks** in one tool with **zero OpenAI dependency**. That combination is SafeO's niche.
 
-### 3. Measured on our own attack library
+### 3. Measured on our own attack library (internal benchmark)
 
-Run `POST /simulate/attack` to reproduce these numbers locally:
+Reproduce every number below with one command (from `backend/`):
+
+```bash
+PYTHONPATH=. python scripts/benchmark.py
+```
 
 | Metric | SafeO | Generic regex-only WAF |
 |--------|-------|------------------------|
-| Detection rate (28 payloads, 8 attack classes) | **92.9%** | **42.9%** |
-| Arabic / Arabizi / mixed payloads (10 tests) | **80.0%** | **20.0%** |
+| Detection (28 payloads, 8 attack classes) | **26 / 28 (92.9%)** | 12 / 28 (42.9%) |
+| Arabic / Arabizi / mixed payloads | **8 / 10 (80.0%)** | 2 / 10 (20.0%) |
+| False positives (20 benign messages) | **2 / 20**, both WARN, no false BLOCK | not measured |
 | Attack classes covered | prompt injection, SQLi, XSS, command injection, path traversal, obfuscation, **arabic_injection**, **arabizi_injection** | Latin patterns only |
 
+**How the sets were built.** The 28 attack payloads live in [`backend/safeo_backend/routes/simulate.py`](backend/safeo_backend/routes/simulate.py): 3 each for six Latin classes, plus 5 Arabic-script and 5 Arabizi payloads that hide SQLi, prompt injection or RTL/zero-width tricks. The 20 benign messages are defined in [`backend/scripts/benchmark.py`](backend/scripts/benchmark.py): 15 English finance, CRM and support messages plus 5 in Arabic, Urdu and Arabizi. A result counts as flagged if the decision is WARN, BLOCK or SANITIZE. Scoring uses a fixed weekday timestamp and a fresh user ID per message so time-of-day and velocity signals don't skew results.
+
+**Known misses.** The two false positives ("Please **select** the premium plan…", "…update the **table** please") trip SQL keyword heuristics; one Arabic and one Arabizi payload score below the WARN threshold. These are small hand-built sets, so treat the numbers as a regression baseline, not a production accuracy claim.
+
 Tier-1 decision latency: **10–50 ms** typical · Tier-2 DistilBERT: **50–200 ms** · BLOCK threshold: **risk ≥ 0.70**
+
+---
+
+## Security testing (SAST + DAST)
+
+SafeO is a security product, so we ran standard AppSec tooling against its own code and API. Scans run on 30 Sep 2026 against this repository.
+
+| Tool | Scope | Result |
+|------|-------|--------|
+| **Semgrep** (`p/python`, `p/owasp-top-ten`) | `backend/safeo_backend`, `frontend/odoo_module` | 5 findings (1 false positive) |
+| **Bandit** | same | 22 findings: 4 medium, 18 low |
+| **OWASP ZAP** API scan (`zap-api-scan.py`, OpenAPI import) | running FastAPI engine, 61 operations / 132 URLs | 0 failures, 5 warning types |
+
+### Findings
+
+| # | Severity | Finding | Tool | Location | Fix |
+|---|----------|---------|------|----------|-----|
+| 1 | **Medium** | **Any-origin CORS with credentials.** `allow_origins` contains `"*"` and `allow_credentials=True`. Browsers reject a literal `*` with credentials, but Starlette 1.3.1 echoes the caller's `Origin` back instead, so any website can make credentialed cross-origin requests and read the responses. Verified live: `Origin: https://evil.example` returns `Access-Control-Allow-Origin: https://evil.example` + `Access-Control-Allow-Credentials: true`. | Semgrep, manual | `backend/safeo_backend/main.py:38` | Remove `"*"`; keep an explicit allowlist (Odoo + website origins) loaded from env |
+| 2 | **Medium** | **Unvalidated input causes unhandled 500s with stack traces.** `network_context` is typed `Optional[str]` on ERP requests but copied into a response field typed `Literal["safe","risky"]`, so any other value raises a Pydantic `ValidationError` after processing. ZAP triggered this on `/erp/crm/lead`, `/erp/finance/action`, `/erp/transaction` and `/erp/employee/activity` (plus `/scanner/website`), and flagged debug/application error disclosure on the responses. | ZAP | `backend/safeo_backend/models/schemas.py:135-163` | Type the request field as `Literal["safe","risky"]` so bad input returns 422; add a generic exception handler that hides internals |
+| 3 | Low / Medium | **Unvalidated IDs in internal API paths.** Odoo controllers interpolate a user-supplied `scan_id` into the backend URL (`/investigations/{scan_id}/approve`), so any logged-in Odoo user could send `../…` to reach other backend routes. Semgrep reports this as SSRF; the host itself is admin-configured, so the real risk is path injection within the internal API. | Semgrep, manual | `frontend/odoo_module/securec_odoo/controllers/main.py:739-766` | Validate `scan_id` against the ID format and URL-encode it; restrict routes to the SafeO user group |
+| 4 | Low | **Hardcoded shared API token.** Odoo calls the engine with a fixed `Authorization: Bearer internal`. | Manual review | `controllers/main.py:53` | Read the token from Odoo system parameters / env; rotate per deployment |
+| 5 | Medium | **Unpinned Hugging Face model downloads** (`from_pretrained` without a revision). | Bandit B615 | `agents/multilingual_agent.py`, `core/ml/tier2_classifier.py` | Pin model revisions (commit hash) |
+| 6 | Low | Missing `X-Content-Type-Options` and `Cross-Origin-Resource-Policy` headers on API responses. | ZAP | all JSON routes | Add a security-headers middleware |
+| 7 | Low | Silent `try/except: pass` blocks (13), non-crypto `random`, subprocess with partial path. | Bandit | various | Log exceptions; use `secrets` where randomness matters |
+| – | False positive | "Credential disclosure in logger": the log line prints the agent **name** when credentials are missing, not the credential. | Semgrep | `backend/safeo_backend/band/bridge.py:53` | None needed |
+
+ZAP's active injection rules (SQLi, XSS, SSTI, OS command injection, path traversal) all passed against the API.
 
 ---
 
